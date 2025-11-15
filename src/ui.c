@@ -2,18 +2,212 @@
 
 #include "ui.h"
 
+#define UI_PREF_WIDTH 80
+#define UI_PREF_HEIGHT 20
+#define UI_MIN_HEIGHT 12
+
 static bool g_ui_ready = false;
+static WINDOW *main_win = NULL;
 static WINDOW *status_win = NULL;
+static int layout_width = 0;
+static int layout_height = 0;
+static int cached_cols = 0;
+static int cached_lines = 0;
+
+static void ui_destroy_windows(void)
+{
+    if (status_win) {
+        delwin(status_win);
+        status_win = NULL;
+    }
+    if (main_win) {
+        delwin(main_win);
+        main_win = NULL;
+    }
+    layout_width = 0;
+    layout_height = 0;
+}
+
+static int clamp_row(int row)
+{
+    if (layout_height <= 0) {
+        return 0;
+    }
+    if (row < 0) {
+        return 0;
+    }
+    if (row >= layout_height) {
+        return layout_height - 1;
+    }
+    return row;
+}
+
+static int clamp_col(int col)
+{
+    if (layout_width <= 0) {
+        return 0;
+    }
+    if (col < 0) {
+        return 0;
+    }
+    if (col >= layout_width) {
+        return layout_width - 1;
+    }
+    return col;
+}
+
+static void ui_relayout(void)
+{
+    if (!g_ui_ready) {
+        return;
+    }
+
+    int term_cols = COLS;
+    int term_lines = LINES;
+
+    if (main_win && term_cols == cached_cols && term_lines == cached_lines) {
+        return;
+    }
+
+    cached_cols = term_cols;
+    cached_lines = term_lines;
+
+    ui_destroy_windows();
+
+    if (term_cols <= 0 || term_lines <= 0) {
+        return;
+    }
+
+    int status_rows = (term_lines > 4) ? 1 : 0;
+    int max_main_height = term_lines - status_rows;
+    if (max_main_height <= 0) {
+        status_rows = 0;
+        max_main_height = term_lines;
+    }
+
+    int height = max_main_height;
+    if (height > UI_PREF_HEIGHT) {
+        height = UI_PREF_HEIGHT;
+    }
+    if (height < UI_MIN_HEIGHT && max_main_height >= UI_MIN_HEIGHT) {
+        height = UI_MIN_HEIGHT;
+    }
+    if (height <= 0) {
+        height = max_main_height;
+    }
+
+    int width = term_cols;
+    if (width > UI_PREF_WIDTH) {
+        width = UI_PREF_WIDTH;
+    }
+    if (width <= 0) {
+        return;
+    }
+
+    int block_height = height + status_rows;
+    if (block_height > term_lines) {
+        block_height = term_lines;
+    }
+
+    int starty = (term_lines - block_height) / 2;
+    if (starty < 0) {
+        starty = 0;
+    }
+    int startx = (term_cols - width) / 2;
+    if (startx < 0) {
+        startx = 0;
+    }
+
+    main_win = newwin(height, width, starty, startx);
+    if (!main_win) {
+        return;
+    }
+    keypad(main_win, TRUE);
+    layout_height = height;
+    layout_width = width;
+
+    if (status_rows > 0) {
+        int status_y = starty + height;
+        if (status_y < term_lines) {
+            status_win = newwin(1, width, status_y, startx);
+        }
+    }
+
+    if (main_win) {
+        werase(main_win);
+        wrefresh(main_win);
+    }
+    if (status_win) {
+        werase(status_win);
+        wrefresh(status_win);
+    }
+    erase();
+    refresh();
+}
+
+static bool ui_layout_ready(void)
+{
+    if (!g_ui_ready) {
+        return false;
+    }
+    ui_relayout();
+    return main_win != NULL;
+}
+
+static bool ui_begin_frame(void)
+{
+    if (!ui_layout_ready()) {
+        return false;
+    }
+    werase(main_win);
+    return true;
+}
 
 static void draw_header(const char *title, const char *subtitle)
 {
-    mvhline(0, 0, ' ', COLS);
-    mvprintw(0, 2, "%s", title ? title : INSTALLER_NAME);
-    if (subtitle) {
-        mvprintw(1, 2, "%s", subtitle);
+    if (!main_win || layout_width <= 0) {
+        return;
     }
-    mvhline(2, 0, ACS_HLINE, COLS);
-    refresh();
+
+    const char *header = title ? title : INSTALLER_NAME;
+    int padding = (layout_width > 4) ? 2 : 0;
+
+    int title_row = clamp_row(0);
+    mvwhline(main_win, title_row, 0, ' ', layout_width);
+    mvwprintw(main_win, title_row, padding, "%s", header);
+
+    if (layout_height > 1) {
+        int subtitle_row = clamp_row(1);
+        mvwhline(main_win, subtitle_row, 0, ' ', layout_width);
+        if (subtitle) {
+            mvwprintw(main_win, subtitle_row, padding, "%s", subtitle);
+        }
+    }
+
+    if (layout_height > 2) {
+        int line_row = clamp_row(2);
+        mvwhline(main_win, line_row, 0, ACS_HLINE, layout_width);
+    }
+}
+
+static int wait_for_keypress(void)
+{
+    WINDOW *win = main_win ? main_win : stdscr;
+    if (!win) {
+        return ERR;
+    }
+
+    int ch;
+    while ((ch = wgetch(win)) != ERR) {
+        if (ch == KEY_RESIZE) {
+            ui_relayout();
+            return KEY_RESIZE;
+        }
+        if (ch == '\n' || ch == KEY_ENTER || ch == 27 || ch == 'q') {
+            return ch;
+        }
+    }
+    return ch;
 }
 
 int ui_init(void)
@@ -36,8 +230,14 @@ int ui_init(void)
     init_pair(1, COLOR_CYAN, -1);
     init_pair(2, COLOR_YELLOW, -1);
 
-    status_win = newwin(1, COLS, LINES - 1, 0);
     g_ui_ready = true;
+    ui_relayout();
+    if (!main_win) {
+        ui_shutdown();
+        fprintf(stderr, "Unable to create installer window\n");
+        return -1;
+    }
+
     return 0;
 }
 
@@ -46,32 +246,35 @@ void ui_shutdown(void)
     if (!g_ui_ready) {
         return;
     }
-    if (status_win) {
-        delwin(status_win);
-        status_win = NULL;
-    }
+    ui_destroy_windows();
+    cached_cols = 0;
+    cached_lines = 0;
     endwin();
     g_ui_ready = false;
 }
 
 void ui_status(const char *message)
 {
-    if (!g_ui_ready || !status_win) {
+    if (!g_ui_ready) {
         return;
     }
-    werase(status_win);
-    mvwprintw(status_win, 0, 1, "%s", message ? message : "");
-    wrefresh(status_win);
-}
-
-static void wait_for_keypress(void)
-{
-    int ch;
-    while ((ch = getch())) {
-        if (ch == '\n' || ch == KEY_ENTER || ch == 27 || ch == 'q') {
-            break;
-        }
+    ui_relayout();
+    if (!status_win) {
+        return;
     }
+
+    int rows = 0;
+    int cols = 0;
+    getmaxyx(status_win, rows, cols);
+    (void)rows;
+    if (cols <= 0) {
+        return;
+    }
+    int col = (cols > 2) ? 1 : 0;
+
+    werase(status_win);
+    mvwprintw(status_win, 0, col, "%s", message ? message : "");
+    wrefresh(status_win);
 }
 
 void ui_message(const char *title, const char *message)
@@ -80,12 +283,29 @@ void ui_message(const char *title, const char *message)
         printf("%s\n", message ? message : "");
         return;
     }
-    clear();
-    draw_header(title ? title : INSTALLER_NAME, NULL);
-    mvprintw(4, 2, "%s", message ? message : "");
-    mvprintw(LINES - 3, 2, "Press Enter to continue...");
-    refresh();
-    wait_for_keypress();
+    while (1) {
+        if (!ui_begin_frame()) {
+            printf("%s\n", message ? message : "");
+            return;
+        }
+        draw_header(title ? title : INSTALLER_NAME, NULL);
+        int message_row = clamp_row(4);
+        mvwprintw(main_win, message_row, clamp_col(2), "%s", message ? message : "");
+
+        int prompt_row = clamp_row(layout_height - 2);
+        if (prompt_row <= message_row) {
+            prompt_row = clamp_row(message_row + 1);
+        }
+        mvwprintw(main_win, prompt_row, clamp_col(2), "Press Enter to continue...");
+
+        wrefresh(main_win);
+
+        int key = wait_for_keypress();
+        if (key == KEY_RESIZE || key == ERR) {
+            continue;
+        }
+        break;
+    }
 }
 
 bool ui_confirm(const char *title, const char *message)
@@ -111,21 +331,35 @@ int ui_menu(const char *title,
     }
 
     while (1) {
-        clear();
+        if (!ui_begin_frame()) {
+            return -1;
+        }
         draw_header(title ? title : INSTALLER_NAME, subtitle);
+        int text_col = (layout_width > 8) ? 4 : 0;
         for (size_t i = 0; i < count; ++i) {
+            int row = clamp_row(4 + (int)i);
             if ((int)i == highlight) {
-                attron(A_REVERSE | COLOR_PAIR(1));
-                mvprintw((int)(4 + i), 4, "> %s", items[i]);
-                attroff(A_REVERSE | COLOR_PAIR(1));
+                wattron(main_win, A_REVERSE | COLOR_PAIR(1));
+                mvwprintw(main_win, row, text_col, "> %s", items[i]);
+                wattroff(main_win, A_REVERSE | COLOR_PAIR(1));
             } else {
-                mvprintw((int)(4 + i), 4, "  %s", items[i]);
+                mvwprintw(main_win, row, text_col, "  %s", items[i]);
             }
         }
-        mvprintw(LINES - 3, 2, "Use arrow keys to navigate, Enter to select, q to exit");
-        refresh();
+        mvwprintw(main_win,
+                  clamp_row(layout_height - 2),
+                  clamp_col(2),
+                  "Use arrow keys to navigate, Enter to select, q to exit");
+        wrefresh(main_win);
 
-        int ch = getch();
+        int ch = wgetch(main_win);
+        if (ch == ERR) {
+            continue;
+        }
+        if (ch == KEY_RESIZE) {
+            ui_relayout();
+            continue;
+        }
         switch (ch) {
         case KEY_UP:
             highlight = (highlight == 0) ? (int)count - 1 : highlight - 1;
@@ -174,22 +408,34 @@ int ui_prompt_input(const char *title,
     }
 
     while (1) {
-        clear();
+        if (!ui_begin_frame()) {
+            return -1;
+        }
         draw_header(title ? title : INSTALLER_NAME, NULL);
-        mvprintw(4, 2, "%s", prompt ? prompt : "Input:");
+        mvwprintw(main_win, clamp_row(4), clamp_col(2), "%s", prompt ? prompt : "Input:");
+        int input_row = clamp_row(6);
+        int input_col = clamp_col(4);
         if (secret) {
             char mask[1024];
             size_t mask_len = len < sizeof(mask) - 1 ? len : sizeof(mask) - 1;
             memset(mask, '*', mask_len);
             mask[mask_len] = '\0';
-            mvprintw(6, 4, "%s", mask);
+            mvwprintw(main_win, input_row, input_col, "%s", mask);
         } else {
-            mvprintw(6, 4, "%s", temp);
+            mvwprintw(main_win, input_row, input_col, "%s", temp);
         }
-        move(6, 4 + (int)len);
-        refresh();
+        int cursor_col = clamp_col(input_col + (int)len);
+        wmove(main_win, input_row, cursor_col);
+        wrefresh(main_win);
 
-        int ch = getch();
+        int ch = wgetch(main_win);
+        if (ch == ERR) {
+            continue;
+        }
+        if (ch == KEY_RESIZE) {
+            ui_relayout();
+            continue;
+        }
         if (ch == '\n' || ch == KEY_ENTER) {
             snprintf(buffer, buffer_len, "%s", temp);
             return 0;
