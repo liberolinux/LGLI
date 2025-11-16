@@ -363,7 +363,15 @@ static int handle_encryption(InstallerState *state)
         ui_message("Encryption", "Unable to create temporary key file.");
         return -1;
     }
-    write(fd, pass, strlen(pass));
+    size_t pass_len = strlen(pass);
+    ssize_t written = write(fd, pass, pass_len);
+    if (written < 0 || (size_t)written != pass_len) {
+        ui_message("Encryption", "Unable to write temporary key file.");
+        close(fd);
+        unlink(key_file);
+        memset(pass, 0, sizeof(pass));
+        return -1;
+    }
     close(fd);
     chmod(key_file, 0600);
     memset(pass, 0, sizeof(pass));

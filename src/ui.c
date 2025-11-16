@@ -394,9 +394,12 @@ int ui_prompt_input(const char *title,
 
     char temp[1024];
     memset(temp, 0, sizeof(temp));
-    size_t limit = (buffer_len < sizeof(temp)) ? buffer_len - 1 : sizeof(temp) - 1;
-    if ((int64_t)limit < 0) {
-        limit = 0;
+    size_t limit = 0;
+    if (buffer_len > 0) {
+        limit = buffer_len - 1;
+    }
+    if (limit > sizeof(temp) - 1) {
+        limit = sizeof(temp) - 1;
     }
 
     size_t len = 0;
