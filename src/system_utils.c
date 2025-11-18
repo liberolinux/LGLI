@@ -95,7 +95,23 @@ static int run_formatted_command(char *buffer, size_t buffer_len, const char *fm
     }
 
     log_info("Executing: %s", buffer);
-    int rc = system(buffer);
+
+    const char *log_path = log_get_path();
+    char cmd_with_redirection[MAX_CMD_LEN * 2];
+
+    if (log_path && *log_path) {
+        if (snprintf(cmd_with_redirection, sizeof(cmd_with_redirection), "%s >> '%s' 2>&1", buffer, log_path) >= (int)sizeof(cmd_with_redirection)) {
+            log_error("Redirected command too long");
+            return -1;
+        }
+    } else {
+        if (snprintf(cmd_with_redirection, sizeof(cmd_with_redirection), "%s >/dev/null 2>&1", buffer) >= (int)sizeof(cmd_with_redirection)) {
+            log_error("Redirected command too long");
+            return -1;
+        }
+    }
+
+    int rc = system(cmd_with_redirection);
     if (rc == -1) {
         log_error("system() failed for %s: %s", buffer, strerror(errno));
         return -1;
