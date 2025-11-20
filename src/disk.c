@@ -99,6 +99,50 @@ static bool copy_with_ellipsis(char *dest, size_t dest_len, const char *src)
     return false;
 }
 
+static int ensure_parent_dir(const char *path)
+{
+    if (!path || !path[0]) {
+        return -1;
+    }
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        return 0;
+    }
+    *slash = '\0';
+    if (dir[0] == '\0') {
+        return 0;
+    }
+    return ensure_directory(dir, 0755);
+}
+
+static void migrate_cache_file(const char *old_path, const char *new_path)
+{
+    if (!old_path || !new_path || strcmp(old_path, new_path) == 0) {
+        return;
+    }
+    if (access(old_path, R_OK) != 0) {
+        return;
+    }
+
+    (void)ensure_parent_dir(new_path);
+
+    if (rename(old_path, new_path) == 0) {
+        return;
+    }
+
+    if (errno == EXDEV) {
+        if (copy_file_simple(old_path, new_path) == 0) {
+            unlink(old_path);
+            return;
+        }
+    }
+
+    log_error("Failed to move cache file from %s to %s: %s", old_path, new_path, strerror(errno));
+}
+
 static int join_path(char *dest, size_t dest_len, const char *base, const char *suffix)
 {
     if (!dest || dest_len == 0 || !base || !suffix) {
@@ -468,6 +512,11 @@ static int mount_partitions(InstallerState *state)
         }
     }
 
+    char cache_dir[PATH_MAX];
+    if (installer_state_cache_dir(state, true, cache_dir, sizeof(cache_dir)) == 0) {
+        ensure_directory(cache_dir, 0755);
+    }
+
     return 0;
 }
 
@@ -585,6 +634,24 @@ static int apply_partitioning(InstallerState *state)
     }
 
     state->disk_prepared = true;
+
+    char old_stage3[PATH_MAX];
+    char old_digest[PATH_MAX];
+    char old_portage[PATH_MAX];
+    snprintf(old_stage3, sizeof(old_stage3), "%s", state->stage3_local);
+    snprintf(old_digest, sizeof(old_digest), "%s", state->stage3_digest_local);
+    snprintf(old_portage, sizeof(old_portage), "%s", state->portage_local);
+
+    char cache_dir[PATH_MAX];
+    if (installer_state_cache_dir(state, true, cache_dir, sizeof(cache_dir)) == 0) {
+        if (ensure_directory(cache_dir, 0755) == 0) {
+            installer_state_set_cache_dir(state, cache_dir);
+            migrate_cache_file(old_stage3, state->stage3_local);
+            migrate_cache_file(old_digest, state->stage3_digest_local);
+            migrate_cache_file(old_portage, state->portage_local);
+        }
+    }
+
     ui_message("Partitioning Complete", "Disk partitioning and mounting finished successfully.");
     return 0;
 }

@@ -14,6 +14,37 @@ static int safe_format(char *buffer, size_t size, const char *fmt, ...)
     return 0;
 }
 
+static int ensure_parent_directory(const char *path)
+{
+    if (!path || !path[0]) {
+        return -1;
+    }
+
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (!slash) {
+        return 0;
+    }
+    *slash = '\0';
+    if (dir[0] == '\0') {
+        return 0;
+    }
+    return ensure_directory(dir, 0755);
+}
+
+static int prepare_cache_dir(const InstallerState *state, char *cache_dir, size_t len)
+{
+    if (installer_state_cache_dir(state, true, cache_dir, len) != 0) {
+        return -1;
+    }
+    if (ensure_directory(cache_dir, 0755) != 0) {
+        log_error("Unable to create cache directory %s", cache_dir);
+        return -1;
+    }
+    return 0;
+}
+
 static int select_arch(InstallerState *state)
 {
     const char *items[] = {"i486 (generic)", "i686 (Pentium Pro+)"};
@@ -96,9 +127,13 @@ static int fetch_stage3_metadata(InstallerState *state)
     const char *base_digest = strrchr(digest_path, '/');
     base_digest = base_digest ? base_digest + 1 : digest_path;
 
-    ensure_directory(INSTALL_CACHE_DIR, 0755);
-    safe_format(state->stage3_local, sizeof(state->stage3_local), "%s/%s", INSTALL_CACHE_DIR, base_stage3);
-    safe_format(state->stage3_digest_local, sizeof(state->stage3_digest_local), "%s/%s", INSTALL_CACHE_DIR, base_digest);
+    char cache_dir[PATH_MAX];
+    if (prepare_cache_dir(state, cache_dir, sizeof(cache_dir)) != 0) {
+        ui_message("Stage3", "Unable to prepare cache directory on the target disk.");
+        return -1;
+    }
+    safe_format(state->stage3_local, sizeof(state->stage3_local), "%s/%s", cache_dir, base_stage3);
+    safe_format(state->stage3_digest_local, sizeof(state->stage3_digest_local), "%s/%s", cache_dir, base_digest);
 
     char message[MAX_MESSAGE_LEN];
     snprintf(message, sizeof(message), "Latest stage3: %s", base_stage3);
@@ -108,15 +143,30 @@ static int fetch_stage3_metadata(InstallerState *state)
 
 static int download_file(const char *url, const char *destination)
 {
-    if (!url[0]) {
+    if (!url[0] || !destination[0]) {
         return -1;
     }
-    ensure_directory(INSTALL_CACHE_DIR, 0755);
+    if (ensure_parent_directory(destination) != 0) {
+        log_error("Unable to prepare directory for %s", destination);
+        return -1;
+    }
     return run_command("wget -O %s %s", destination, url);
 }
 
 static int download_stage3(InstallerState *state)
 {
+    if (!state->disk_prepared) {
+        ui_message("Download", "Prepare and mount the target disk before downloading stage3 so the archive is stored on the disk.");
+        return -1;
+    }
+
+    char cache_dir[PATH_MAX];
+    if (prepare_cache_dir(state, cache_dir, sizeof(cache_dir)) != 0) {
+        ui_message("Download", "Unable to prepare cache directory on the target disk.");
+        return -1;
+    }
+    installer_state_set_cache_dir(state, cache_dir);
+
     if (!state->stage3_url[0]) {
         if (fetch_stage3_metadata(state) != 0) {
             return -1;
@@ -197,8 +247,19 @@ static int verify_stage3(const InstallerState *state)
 
 static int download_portage(InstallerState *state)
 {
+    if (!state->disk_prepared) {
+        ui_message("Portage", "Prepare and mount the target disk before downloading Portage so it is stored on disk.");
+        return -1;
+    }
+
+    char cache_dir[PATH_MAX];
+    if (prepare_cache_dir(state, cache_dir, sizeof(cache_dir)) != 0) {
+        ui_message("Portage", "Unable to prepare cache directory on the target disk.");
+        return -1;
+    }
+
     safe_format(state->portage_url, sizeof(state->portage_url), "%s/%s", PORTAGE_BASE_URL, PORTAGE_SNAPSHOT_NAME);
-    safe_format(state->portage_local, sizeof(state->portage_local), "%s/%s", INSTALL_CACHE_DIR, PORTAGE_SNAPSHOT_NAME);
+    safe_format(state->portage_local, sizeof(state->portage_local), "%s/%s", cache_dir, PORTAGE_SNAPSHOT_NAME);
     if (download_file(state->portage_url, state->portage_local) != 0) {
         ui_message("Portage", "Failed to download Portage snapshot.");
         return -1;

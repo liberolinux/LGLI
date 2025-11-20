@@ -75,5 +75,7 @@ void installer_state_init(InstallerState *state);
 const char *arch_to_string(GentooArch arch);
 const char *boot_mode_to_string(BootMode mode);
 const char *fs_to_string(FilesystemType fs);
+int installer_state_cache_dir(const InstallerState *state, bool prefer_install_root, char *buffer, size_t len);
+void installer_state_set_cache_dir(InstallerState *state, const char *cache_dir);
 
 #endif /* LIBERO_INSTALLER_STATE_H */

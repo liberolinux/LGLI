@@ -97,3 +97,73 @@ const char *fs_to_string(FilesystemType fs)
         return "unknown";
     }
 }
+
+static void filename_from_path(const char *path, const char *fallback, char *out, size_t len)
+{
+    if (!out || len == 0) {
+        return;
+    }
+    const char *name = fallback;
+    if (path && path[0]) {
+        const char *slash = strrchr(path, '/');
+        name = slash ? (slash + 1) : path;
+    }
+    if (!name || !name[0]) {
+        name = fallback;
+    }
+    snprintf(out, len, "%s", name ? name : "");
+}
+
+static void build_cache_path(char *dest, size_t dest_len, const char *cache_dir, const char *name)
+{
+    if (!dest || dest_len == 0 || !cache_dir || !cache_dir[0] || !name || !name[0]) {
+        return;
+    }
+    size_t dir_len = strlen(cache_dir);
+    size_t name_len = strlen(name);
+    size_t needed = dir_len + 1 + name_len + 1; /* dir + slash + name + null */
+    if (needed > dest_len) {
+        dest[0] = '\0';
+        return;
+    }
+
+    memcpy(dest, cache_dir, dir_len);
+    dest[dir_len] = '/';
+    memcpy(dest + dir_len + 1, name, name_len);
+    dest[dir_len + 1 + name_len] = '\0';
+}
+
+int installer_state_cache_dir(const InstallerState *state, bool prefer_install_root, char *buffer, size_t len)
+{
+    if (!state || !buffer || len == 0) {
+        return -1;
+    }
+
+    const bool can_use_target = prefer_install_root && state->disk_prepared && state->install_root[0];
+    const char *base = can_use_target ? state->install_root : "";
+    const char *suffix = INSTALL_CACHE_DIR;
+
+    if (snprintf(buffer, len, "%s%s", base, suffix) >= (int)len) {
+        return -1;
+    }
+    return 0;
+}
+
+void installer_state_set_cache_dir(InstallerState *state, const char *cache_dir)
+{
+    if (!state || !cache_dir || !cache_dir[0]) {
+        return;
+    }
+
+    char stage3_name[PATH_MAX];
+    char digest_name[PATH_MAX];
+    char portage_name[PATH_MAX];
+
+    filename_from_path(state->stage3_local, "stage3.tar.xz", stage3_name, sizeof(stage3_name));
+    filename_from_path(state->stage3_digest_local, "stage3.tar.xz.DIGESTS", digest_name, sizeof(digest_name));
+    filename_from_path(state->portage_local, PORTAGE_SNAPSHOT_NAME, portage_name, sizeof(portage_name));
+
+    build_cache_path(state->stage3_local, sizeof(state->stage3_local), cache_dir, stage3_name);
+    build_cache_path(state->stage3_digest_local, sizeof(state->stage3_digest_local), cache_dir, digest_name);
+    build_cache_path(state->portage_local, sizeof(state->portage_local), cache_dir, portage_name);
+}
