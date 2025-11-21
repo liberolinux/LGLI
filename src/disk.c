@@ -257,6 +257,117 @@ static void partition_path(const char *disk, int number, char *buffer, size_t le
     snprintf(buffer, len, "%s%s%d", disk, suffix, number);
 }
 
+static int deactivate_swap_for_disk(const char *disk)
+{
+    FILE *f = fopen("/proc/swaps", "r");
+    if (!f) {
+        return 0;
+    }
+
+    char line[PATH_MAX + 64];
+    if (!fgets(line, sizeof(line), f)) {
+        fclose(f);
+        return 0;
+    }
+
+    int rc = 0;
+    size_t disk_len = strlen(disk);
+    while (fgets(line, sizeof(line), f)) {
+        char entry[PATH_MAX] = {0};
+        if (sscanf(line, "%s", entry) != 1) {
+            continue;
+        }
+        if (strncmp(entry, disk, disk_len) != 0) {
+            continue;
+        }
+        if (run_command("swapoff %s", entry) != 0) {
+            rc = -1;
+        }
+    }
+
+    fclose(f);
+    return rc;
+}
+
+static int deactivate_disk_usage(const char *disk)
+{
+    if (!disk || !disk[0]) {
+        return -1;
+    }
+
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "lsblk -nrpo NAME,TYPE,MOUNTPOINT %s", disk);
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        log_error("Unable to inspect disk usage for %s: %s", disk, strerror(errno));
+        return -1;
+    }
+
+    char line[PATH_MAX * 2];
+    int rc = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        char name[PATH_MAX] = {0};
+        char type[32] = {0};
+        char mountpoint[PATH_MAX] = {0};
+
+        int fields = sscanf(line, "%s %31s %s", name, type, mountpoint);
+        if (fields < 2) {
+            continue;
+        }
+        if (strcmp(type, "disk") == 0) {
+            continue;
+        }
+
+        bool is_swap = (fields == 3 && strcmp(mountpoint, "[SWAP]") == 0);
+        bool is_mounted = (fields == 3 && mountpoint[0] && strcmp(mountpoint, "-") != 0);
+
+        if (is_swap) {
+            if (run_command("swapoff %s", name) != 0) {
+                rc = -1;
+            }
+        } else if (is_mounted) {
+            if (run_command("umount -f %s", name) != 0) {
+                rc = -1;
+            }
+        }
+
+        if (strcmp(type, "crypt") == 0) {
+            const char *mapper = strrchr(name, '/');
+            mapper = mapper ? mapper + 1 : name;
+            if (run_command("cryptsetup close %s", mapper) != 0) {
+                rc = -1;
+            }
+        } else if (strcmp(type, "lvm") == 0) {
+            if (run_command("lvchange -an %s", name) != 0) {
+                rc = -1;
+            }
+        }
+    }
+
+    pclose(fp);
+    if (deactivate_swap_for_disk(disk) != 0) {
+        rc = -1;
+    }
+    return rc;
+}
+
+static void log_fs_probe(const char *device)
+{
+    if (!device || !device[0]) {
+        return;
+    }
+
+    char cmd[PATH_MAX + 32];
+    snprintf(cmd, sizeof(cmd), "blkid -o export %s", device);
+    char output[512];
+    if (capture_command(cmd, output, sizeof(output)) == 0 && output[0]) {
+        log_info("blkid export for %s:\n%s", device, output);
+    } else {
+        log_error("blkid probe failed for %s", device);
+    }
+}
+
 static int select_disk(InstallerState *state)
 {
     size_t count = 0;
@@ -354,7 +465,8 @@ static int format_root(const InstallerState *state)
     const char *device = state->root_mapper[0] ? state->root_mapper : state->root_partition;
     switch (state->root_fs) {
     case FS_EXT4:
-        return run_command("mkfs.ext4 -F %s", device);
+        /* Disable newer ext4 features for compatibility with older kernels */
+        return run_command("mkfs.ext4 -F -O ^orphan_file,^metadata_csum,^metadata_csum_seed %s", device);
     case FS_XFS:
         return run_command("mkfs.xfs -f %s", device);
     case FS_BTRFS:
@@ -539,6 +651,11 @@ static int apply_partitioning(InstallerState *state)
         return -1;
     }
 
+    if (deactivate_disk_usage(state->target_disk) != 0) {
+        ui_message("Disk", "Unable to release the disk. Close any mounts or LVM/LUKS mappings and try again.");
+        return -1;
+    }
+
     if (run_command("wipefs -a %s", state->target_disk) != 0) {
         return -1;
     }
@@ -680,11 +797,12 @@ int disk_workflow(InstallerState *state)
             "Toggle LUKS encryption",
             "Toggle LVM support",
             "Partition, format, and mount",
+            "Mount target partitions",
             "Back to main menu",
         };
 
-        int choice = ui_menu("Disk Preparation", subtitle, items, 8, 0);
-        if (choice < 0 || choice == 7) {
+        int choice = ui_menu("Disk Preparation", subtitle, items, 9, 0);
+        if (choice < 0 || choice == 8) {
             return 0;
         }
 
@@ -710,14 +828,56 @@ int disk_workflow(InstallerState *state)
         case 6:
             apply_partitioning(state);
             break;
+        case 7:
+            disk_mount_targets(state);
+            break;
         default:
             break;
         }
     }
 }
 
-int disk_mount_targets(const InstallerState *state)
+int disk_mount_targets(InstallerState *state)
 {
-    (void)state;
+    if (!state) {
+        return -1;
+    }
+    if (!state->target_disk[0]) {
+        ui_message("Mount", "Select a target disk first.");
+        return -1;
+    }
+    if (!state->root_partition[0]) {
+        ui_message("Mount", "No root partition recorded. Run partitioning first.");
+        return -1;
+    }
+
+    char root_device[PATH_MAX];
+    snprintf(root_device, sizeof(root_device), "%s", state->root_mapper[0] ? state->root_mapper : state->root_partition);
+
+    if (ensure_directory(state->install_root, 0755) != 0) {
+        log_error("Unable to create install root directory %s: %s", state->install_root, strerror(errno));
+        ui_message("Mount", "Unable to create install root directory.");
+        return -1;
+    }
+
+    if (is_path_mounted(state->install_root)) {
+        state->disk_prepared = true;
+        log_info("Install root already mounted at %s", state->install_root);
+        ui_message("Mount", "Root partition already mounted.");
+        return 0;
+    }
+
+    log_info("Attempting to mount root device %s to %s as %s with options defaults,noatime",
+             root_device, state->install_root, fs_to_string(state->root_fs));
+    log_fs_probe(root_device);
+
+    if (mount_fs(root_device, state->install_root, fs_to_string(state->root_fs), "defaults,noatime") != 0) {
+        ui_message("Mount", "Failed to mount the root partition. Check the log for details.");
+        return -1;
+    }
+
+    state->disk_prepared = true;
+    log_info("Mounted root device %s on %s", root_device, state->install_root);
+    ui_message("Mount", "Root partition mounted at the install root.");
     return 0;
 }

@@ -1,4 +1,5 @@
 #include "bootstrap.h"
+#include "disk.h"
 #include <stdarg.h>
 
 static int safe_format(char *buffer, size_t size, const char *fmt, ...)
@@ -155,8 +156,9 @@ static int download_file(const char *url, const char *destination)
 
 static int download_stage3(InstallerState *state)
 {
+    state->disk_prepared = is_path_mounted(state->install_root);
     if (!state->disk_prepared) {
-        ui_message("Download", "Prepare and mount the target disk before downloading stage3 so the archive is stored on the disk.");
+        ui_message("Download", "Root partition is not mounted at the install path. Use Disk preparation -> Mount target partitions, then try again.");
         return -1;
     }
 

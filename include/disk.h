@@ -7,6 +7,6 @@
 #include "log.h"
 
 int disk_workflow(InstallerState *state);
-int disk_mount_targets(const InstallerState *state);
+int disk_mount_targets(InstallerState *state);
 
 #endif /* LIBERO_INSTALLER_DISK_H */

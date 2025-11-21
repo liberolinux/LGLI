@@ -7,6 +7,74 @@
 #include "log.h"
 #include "ui.h"
 
+bool is_path_mounted(const char *path)
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+
+    char target[PATH_MAX];
+    snprintf(target, sizeof(target), "%s", path);
+
+    size_t len = strlen(target);
+    while (len > 1 && target[len - 1] == '/') {
+        target[--len] = '\0';
+    }
+
+    FILE *f = fopen("/proc/mounts", "r");
+    if (!f) {
+        return false;
+    }
+
+    char line[PATH_MAX * 2];
+    bool mounted = false;
+    while (fgets(line, sizeof(line), f)) {
+        char dev[PATH_MAX];
+        char mountpoint[PATH_MAX];
+        if (sscanf(line, "%s %s", dev, mountpoint) != 2) {
+            continue;
+        }
+        if (strcmp(mountpoint, target) == 0) {
+            mounted = true;
+            break;
+        }
+    }
+    fclose(f);
+    return mounted;
+}
+
+static void ensure_command_path(void)
+{
+    static bool path_set;
+
+    if (path_set) {
+        return;
+    }
+
+    const char *default_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const char *current = getenv("PATH");
+
+    if (!current || !*current) {
+        setenv("PATH", default_path, 1);
+        path_set = true;
+        return;
+    }
+
+    if (strstr(current, "/sbin") != NULL) {
+        path_set = true;
+        return;
+    }
+
+    char new_path[PATH_MAX];
+    if (snprintf(new_path, sizeof(new_path), "%s:%s", default_path, current) >= (int)sizeof(new_path)) {
+        setenv("PATH", default_path, 1);
+    } else {
+        setenv("PATH", new_path, 1);
+    }
+
+    path_set = true;
+}
+
 static int mkdir_p(const char *path, mode_t mode)
 {
     if (!path || !*path) {
@@ -116,6 +184,8 @@ static void shorten_for_display(const char *input, char *output, size_t output_l
 
 static int run_formatted_command(char *buffer, size_t buffer_len, const char *fmt, va_list args)
 {
+    ensure_command_path();
+
     if (vsnprintf(buffer, buffer_len, fmt, args) >= (int)buffer_len) {
         log_error("Command too long");
         return -1;
@@ -163,9 +233,18 @@ static int run_formatted_command(char *buffer, size_t buffer_len, const char *fm
     if (WIFEXITED(status)) {
         int code = WEXITSTATUS(status);
         if (code != 0) {
-            log_error("Command '%s' exited with %d", buffer, code);
+            if (code == 127) {
+                const char *path = getenv("PATH");
+                log_error("Command not found: '%s' (PATH=%s)", buffer, path ? path : "(unset)");
+            } else {
+                log_error("Command '%s' exited with %d", buffer, code);
+            }
             char message[256];
-            snprintf(message, sizeof(message), "'%s' failed (exit %d). See log: %s", display_cmd, code, log_get_path());
+            if (code == 127) {
+                snprintf(message, sizeof(message), "'%s' is not available (exit 127). See log: %s", display_cmd, log_get_path());
+            } else {
+                snprintf(message, sizeof(message), "'%s' failed (exit %d). See log: %s", display_cmd, code, log_get_path());
+            }
             ui_error("Command Failed", message);
             return -code;
         }
@@ -347,7 +426,7 @@ int mount_fs(const char *device, const char *mountpoint, const char *fstype, con
 
     const char *opts = options ? options : "";
     if (mount(device, mountpoint, fstype, 0, opts) != 0) {
-        log_error("Failed to mount %s on %s: %s", device, mountpoint, strerror(errno));
+        log_error("Failed to mount %s on %s (type=%s opts=%s): %s", device, mountpoint, fstype, opts, strerror(errno));
         return -1;
     }
 

@@ -16,5 +16,6 @@ int umount_path(const char *path);
 int get_block_uuid(const char *device, char *buffer, size_t buffer_len);
 long get_disk_size_mb(const char *device);
 int shell_escape_single_quotes(const char *input, char *output, size_t output_len);
+bool is_path_mounted(const char *path);
 
 #endif /* LIBERO_INSTALLER_SYSTEM_UTILS_H */
