@@ -465,8 +465,7 @@ static int format_root(const InstallerState *state)
     const char *device = state->root_mapper[0] ? state->root_mapper : state->root_partition;
     switch (state->root_fs) {
     case FS_EXT4:
-        /* Disable newer ext4 features for compatibility with older kernels */
-        return run_command("mkfs.ext4 -F -O ^orphan_file,^metadata_csum,^metadata_csum_seed %s", device);
+        return run_command("mkfs.ext4 -F %s", device);
     case FS_XFS:
         return run_command("mkfs.xfs -f %s", device);
     case FS_BTRFS:
