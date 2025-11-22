@@ -3,6 +3,15 @@
 #include <dirent.h>
 #include <fcntl.h>
 
+#define GPT_TYPE_EFI "C12A7328-F81F-11D2-BA4B-00A0C93EC93B"
+#define GPT_TYPE_LINUX "0FC63DAF-8483-4772-8E79-3D69D8477DE4"
+#define GPT_TYPE_SWAP "0657FD6D-A4AB-43C4-84E5-0933C84B4F4F"
+#define GPT_TYPE_LVM "E6D6D379-F507-44C2-A23C-238F2A3DF928"
+
+#define MBR_TYPE_LINUX "83"
+#define MBR_TYPE_SWAP "82"
+#define MBR_TYPE_LVM "8e"
+
 #define LABEL_BOOT "LIBERO_BOOT"
 #define LABEL_EFI "LIBERO_EFI"
 #define LABEL_ROOT "LIBERO_ROOT"
@@ -16,9 +25,16 @@ typedef struct {
 } DiskInfo;
 
 typedef struct {
+    const char *role;
+    const char *label;
+    const char *gpt_type;
+    const char *mbr_type;
+    int part_number;
+    char size_spec[32];
     char device[PATH_MAX];
-    char size[32];
-} PartitionChoice;
+} PartitionSpec;
+
+#define MAX_PARTITION_SPECS 8
 
 static int is_usable_disk(const char *name)
 {
@@ -128,154 +144,99 @@ static int ensure_parent_dir(const char *path)
     return ensure_directory(dir, 0755);
 }
 
-static PartitionChoice *list_disk_partitions(const char *disk, size_t *out_count)
+static PartitionSpec *plan_add_partition(PartitionSpec *plan, size_t *count, int number,
+                                         const char *role, const char *size_spec,
+                                         const char *label, const char *gpt_type, const char *mbr_type)
 {
-    if (!disk || !disk[0]) {
+    if (!plan || !count || *count >= MAX_PARTITION_SPECS) {
         return NULL;
     }
-
-    char cmd[PATH_MAX + 64];
-    snprintf(cmd, sizeof(cmd), "lsblk -nrpo NAME,TYPE,SIZE %s", disk);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) {
-        return NULL;
+    PartitionSpec *spec = &plan[*count];
+    spec->role = role;
+    spec->label = label;
+    spec->gpt_type = gpt_type;
+    spec->mbr_type = mbr_type;
+    spec->part_number = number;
+    spec->device[0] = '\0';
+    if (size_spec && size_spec[0]) {
+        snprintf(spec->size_spec, sizeof(spec->size_spec), "%s", size_spec);
+    } else {
+        spec->size_spec[0] = '\0';
     }
-
-    size_t capacity = 8;
-    size_t count = 0;
-    PartitionChoice *entries = calloc(capacity, sizeof(*entries));
-    if (!entries) {
-        pclose(fp);
-        return NULL;
-    }
-
-    char line[PATH_MAX + 64];
-    while (fgets(line, sizeof(line), fp)) {
-        char name[PATH_MAX];
-        char type[32];
-        char size[32];
-        if (sscanf(line, "%s %31s %31s", name, type, size) != 3) {
-            continue;
-        }
-        if (strcmp(type, "part") != 0) {
-            continue;
-        }
-        if (count == capacity) {
-            capacity *= 2;
-            PartitionChoice *tmp = realloc(entries, capacity * sizeof(*entries));
-            if (!tmp) {
-                free(entries);
-                pclose(fp);
-                return NULL;
-            }
-            entries = tmp;
-        }
-        snprintf(entries[count].device, sizeof(entries[count].device), "%s", name);
-        snprintf(entries[count].size, sizeof(entries[count].size), "%s", size);
-        count++;
-    }
-    pclose(fp);
-    if (count == 0) {
-        free(entries);
-        return NULL;
-    }
-    if (out_count) {
-        *out_count = count;
-    }
-    return entries;
+    (*count)++;
+    return spec;
 }
 
-static int prompt_partition_selection(const char *title,
-                                      const char *subtitle,
-                                      PartitionChoice *choices,
-                                      size_t count,
-                                      bool *used,
-                                      bool optional,
-                                      char *out,
-                                      size_t out_len)
+static PartitionSpec *find_partition_spec(PartitionSpec *plan, size_t count, const char *role)
 {
-    if (!choices || count == 0 || !out || out_len == 0) {
-        return -1;
+    if (!plan || !role) {
+        return NULL;
     }
-
-    size_t available = 0;
     for (size_t i = 0; i < count; ++i) {
-        if (!used[i]) {
-            available++;
+        if (plan[i].role && strcmp(plan[i].role, role) == 0) {
+            return &plan[i];
         }
     }
-    if (available == 0) {
-        if (optional) {
-            out[0] = '\0';
-            return 0;
-        }
-        ui_message(title, "No unused partitions remain.");
-        return -1;
-    }
+    return NULL;
+}
 
-    size_t item_total = available + (optional ? 1 : 0);
-    char **items = calloc(item_total, sizeof(char *));
-    int *index_map = calloc(item_total, sizeof(int));
-    if (!items || !index_map) {
-        free(items);
-        free(index_map);
-        return -1;
+static const char *role_mountpoint(const char *role)
+{
+    if (!role) {
+        return "?";
     }
+    if (strcmp(role, "efi") == 0) {
+        return "/boot/efi";
+    }
+    if (strcmp(role, "boot") == 0) {
+        return "/boot";
+    }
+    if (strcmp(role, "root") == 0) {
+        return "/";
+    }
+    if (strcmp(role, "swap") == 0) {
+        return "swap";
+    }
+    return role;
+}
 
-    size_t idx = 0;
+static void summarize_partition_plan(const char *disk,
+                                     long disk_mb,
+                                     const PartitionSpec *plan,
+                                     size_t count,
+                                     char *buffer,
+                                     size_t len)
+{
+    if (!buffer || len == 0) {
+        return;
+    }
+    buffer[0] = '\0';
+
+    char header[256];
+    snprintf(header, sizeof(header),
+             "Target: %s (%ld MB)\n\n%-6s %-6s %-12s %-12s %-12s\n%-6s %-6s %-12s %-12s %-12s\n",
+             disk ? disk : "<unknown>", disk_mb,
+             "Role", "Part#", "Size", "Mount", "Label",
+             "-----", "-----", "------------", "------------", "------------");
+    strncat(buffer, header, len - strlen(buffer) - 1);
+
     for (size_t i = 0; i < count; ++i) {
-        if (used[i]) {
-            continue;
+        const PartitionSpec *spec = &plan[i];
+        const char *size_text = spec->size_spec[0] ? spec->size_spec : "rest-of-disk";
+        const char *label = spec->label ? spec->label : "";
+
+        char line[256];
+        snprintf(line, sizeof(line), "%-6s %-6d %-12s %-12s %-12s\n",
+                 spec->role ? spec->role : "?",
+                 spec->part_number,
+                 size_text,
+                 role_mountpoint(spec->role),
+                 label);
+        strncat(buffer, line, len - strlen(buffer) - 1);
+        if (strlen(buffer) + 1 >= len) {
+            break;
         }
-        char display[PATH_MAX + 48];
-        snprintf(display, sizeof(display), "%s (%s)", choices[i].device, choices[i].size);
-        items[idx] = strdup(display);
-        if (!items[idx]) {
-            for (size_t j = 0; j < idx; ++j) {
-                free(items[j]);
-            }
-            free(items);
-            free(index_map);
-            return -1;
-        }
-        index_map[idx] = (int)i;
-        idx++;
     }
-    if (optional) {
-        items[idx] = strdup("<Skip>");
-        if (!items[idx]) {
-            for (size_t j = 0; j < idx; ++j) {
-                free(items[j]);
-            }
-            free(items);
-            free(index_map);
-            return -1;
-        }
-        index_map[idx] = -1;
-    }
-
-    int choice = ui_menu(title, subtitle, (const char **)items, item_total, 0);
-    for (size_t i = 0; i < item_total; ++i) {
-        free(items[i]);
-    }
-    free(items);
-
-    if (choice < 0) {
-        free(index_map);
-        return -1;
-    }
-
-    int selected_index = index_map[choice];
-    free(index_map);
-
-    if (selected_index < 0) {
-        out[0] = '\0';
-        return 0;
-    }
-
-    used[selected_index] = true;
-    snprintf(out, out_len, "%s", choices[selected_index].device);
-    return 0;
 }
 
 static void migrate_cache_file(const char *old_path, const char *new_path)
@@ -735,80 +696,128 @@ static int apply_partitioning(InstallerState *state)
         return -1;
     }
 
-    ui_message("fdisk", "The installer will now launch fdisk. Create or edit partitions as needed, then quit fdisk.");
-    char fdisk_cmd[PATH_MAX + 32];
-    snprintf(fdisk_cmd, sizeof(fdisk_cmd), "/usr/sbin/fdisk %s", state->target_disk);
-    if (ui_run_shell_command("fdisk", fdisk_cmd) != 0) {
-        ui_message("Partitioning", "fdisk reported an error.");
+    const bool use_gpt = (state->boot_mode == BOOTMODE_UEFI);
+    const bool create_swap_partition = (!state->use_lvm && state->swap_size_mb > 0);
+
+    double consumed_mb = 1.0;
+    if (use_gpt) {
+        consumed_mb += 512.0;
+    }
+    consumed_mb += 512.0;
+    if (create_swap_partition) {
+        consumed_mb += state->swap_size_mb;
+    }
+
+    double root_end = state->disk_size_mb - 8;
+    if (root_end <= consumed_mb + 128) {
+        ui_message("Partitioning", "Not enough space for root filesystem.");
         return -1;
     }
 
-    if (run_command("partprobe %s", state->target_disk) != 0) {
-        return -1;
-    }
+    PartitionSpec plan[MAX_PARTITION_SPECS] = {0};
+    size_t plan_count = 0;
+    int next_part = 1;
 
-    size_t part_count = 0;
-    PartitionChoice *parts = list_disk_partitions(state->target_disk, &part_count);
-    if (!parts) {
-        ui_message("Partitioning", "Unable to detect partitions on the target disk.");
-        return -1;
-    }
-    bool *used = calloc(part_count, sizeof(bool));
-    if (!used) {
-        free(parts);
-        return -1;
-    }
-
-    if (state->boot_mode == BOOTMODE_UEFI) {
-        if (prompt_partition_selection("EFI Partition",
-                                       "Select the partition that will be mounted at /boot/efi",
-                                       parts, part_count, used, false,
-                                       state->efi_partition, sizeof(state->efi_partition)) != 0) {
-            free(used);
-            free(parts);
+    if (use_gpt) {
+        if (!plan_add_partition(plan, &plan_count, next_part++, "efi", "+512M",
+                                LABEL_EFI, GPT_TYPE_EFI, NULL)) {
+            ui_message("Partitioning", "Unable to plan EFI partition.");
+            return -1;
+        }
+        if (!plan_add_partition(plan, &plan_count, next_part++, "boot", "+512M",
+                                LABEL_BOOT, GPT_TYPE_LINUX, MBR_TYPE_LINUX)) {
+            ui_message("Partitioning", "Unable to plan boot partition.");
             return -1;
         }
     } else {
         state->efi_partition[0] = '\0';
-    }
-
-    if (state->boot_mode == BOOTMODE_UEFI) {
-        if (prompt_partition_selection("Boot Partition",
-                                       "Select the partition that will be mounted at /boot",
-                                       parts, part_count, used, false,
-                                       state->boot_partition, sizeof(state->boot_partition)) != 0) {
-            free(used);
-            free(parts);
-            return -1;
-        }
-    } else {
         state->boot_partition[0] = '\0';
     }
 
-    if (prompt_partition_selection("Root Partition",
-                                   "Select the partition that will contain the root filesystem",
-                                   parts, part_count, used, false,
-                                   state->root_partition, sizeof(state->root_partition)) != 0) {
-        free(used);
-        free(parts);
-        return -1;
-    }
-
-    if (!state->use_lvm && state->swap_size_mb > 0) {
-        if (prompt_partition_selection("Swap Partition",
-                                       "Select a partition for swap (or choose Skip)",
-                                       parts, part_count, used, true,
-                                       state->swap_partition, sizeof(state->swap_partition)) != 0) {
-            free(used);
-            free(parts);
+    if (create_swap_partition) {
+        char swap_size[32];
+        snprintf(swap_size, sizeof(swap_size), "+%ldM", state->swap_size_mb);
+        if (!plan_add_partition(plan, &plan_count, next_part++, "swap", swap_size,
+                                LABEL_SWAP, GPT_TYPE_SWAP, MBR_TYPE_SWAP)) {
+            ui_message("Partitioning", "Unable to plan swap partition.");
             return -1;
         }
     } else {
         state->swap_partition[0] = '\0';
     }
 
-    free(used);
-    free(parts);
+    const char *root_gpt = state->use_lvm ? GPT_TYPE_LVM : GPT_TYPE_LINUX;
+    const char *root_mbr = state->use_lvm ? MBR_TYPE_LVM : MBR_TYPE_LINUX;
+    if (!plan_add_partition(plan, &plan_count, next_part++, "root", "-8M",
+                            LABEL_ROOT, root_gpt, root_mbr)) {
+        ui_message("Partitioning", "Unable to plan root partition.");
+        return -1;
+    }
+
+    char summary[1024];
+    summarize_partition_plan(state->target_disk, state->disk_size_mb, plan, plan_count, summary, sizeof(summary));
+    ui_message("Partition Layout", summary);
+
+    char script_path[] = "/tmp/libero-fdiskXXXXXX";
+    int script_fd = mkstemp(script_path);
+    if (script_fd < 0) {
+        ui_message("Partitioning", "Unable to create script file for fdisk.");
+        return -1;
+    }
+    for (size_t i = 0; i < plan_count; ++i) {
+        PartitionSpec *spec = &plan[i];
+        dprintf(script_fd, "n\n");
+        if (state->boot_mode == BOOTMODE_LEGACY) {
+            dprintf(script_fd, "p\n");
+        }
+        dprintf(script_fd, "%d\n\n%s\n", spec->part_number, spec->size_spec[0] ? spec->size_spec : "");
+    }
+    if (state->boot_mode == BOOTMODE_LEGACY) {
+        PartitionSpec *boot_spec = find_partition_spec(plan, plan_count, "boot");
+        if (boot_spec) {
+            dprintf(script_fd, "a\n%d\n", boot_spec->part_number);
+        }
+    }
+    dprintf(script_fd, "w\n");
+    close(script_fd);
+
+    if (run_command("/usr/sbin/fdisk %s < %s", state->target_disk, script_path) != 0) {
+        unlink(script_path);
+        ui_message("Partitioning", "fdisk failed to apply the partition layout.");
+        return -1;
+    }
+    unlink(script_path);
+
+    for (size_t i = 0; i < plan_count; ++i) {
+        PartitionSpec *spec = &plan[i];
+        const char *suffix = (isdigit((unsigned char)state->target_disk[strlen(state->target_disk) - 1]) ? "p" : "");
+        int written = snprintf(spec->device, sizeof(spec->device), "%s%s%d",
+                               state->target_disk, suffix, spec->part_number);
+        if (written < 0 || written >= (int)sizeof(spec->device)) {
+            ui_message("Partitioning", "Generated partition path is too long.");
+            return -1;
+        }
+        if (strcmp(spec->role, "efi") == 0) {
+            snprintf(state->efi_partition, sizeof(state->efi_partition), "%s", spec->device);
+        } else if (strcmp(spec->role, "boot") == 0) {
+            snprintf(state->boot_partition, sizeof(state->boot_partition), "%s", spec->device);
+        } else if (strcmp(spec->role, "swap") == 0) {
+            snprintf(state->swap_partition, sizeof(state->swap_partition), "%s", spec->device);
+        } else if (strcmp(spec->role, "root") == 0) {
+            snprintf(state->root_partition, sizeof(state->root_partition), "%s", spec->device);
+        }
+    }
+
+    for (size_t i = 0; i < plan_count; ++i) {
+        PartitionSpec *spec = &plan[i];
+        const char *type = use_gpt ? spec->gpt_type : spec->mbr_type;
+        if (type && type[0]) {
+            if (run_command("sfdisk --part-type %s %d %s", state->target_disk, spec->part_number, type) != 0) {
+                ui_message("Partitioning", "Unable to set partition type.");
+                return -1;
+            }
+        }
+    }
 
     if (run_command("partprobe %s", state->target_disk) != 0) {
         return -1;
@@ -950,7 +959,7 @@ int disk_mount_targets(InstallerState *state)
         return 0;
     }
 
-    log_info("Attempting to mount root device %s to %s as %s with options defaults,noatime",
+    log_info("Attempting to mount root device %s to %s as %s",
              root_device, state->install_root, fs_to_string(state->root_fs));
     log_fs_probe(root_device);
 
