@@ -1,5 +1,12 @@
 #include <ncurses.h>
+#include <pty.h>
+#include <signal.h>
+#include <sys/ioctl.h>
+#include <sys/select.h>
+#include <sys/time.h>
 #include <sys/wait.h>
+#include <termios.h>
+#include <unistd.h>
 
 #include "ui.h"
 
@@ -393,6 +400,52 @@ void ui_message(const char *title, const char *message)
 void ui_error(const char *title, const char *message)
 {
     show_modal_message(title ? title : "Error", message, 3);
+}
+
+int ui_run_shell_command(const char *title, const char *command)
+{
+    if (!command || !command[0]) {
+        return -1;
+    }
+
+    if (!g_ui_ready) {
+        int rc = system(command);
+        if (rc == -1) {
+            return -1;
+        }
+        if (WIFEXITED(rc)) {
+            return WEXITSTATUS(rc);
+        }
+        return -1;
+    }
+
+    def_prog_mode();
+    endwin();
+    if (title && title[0]) {
+        fprintf(stdout, "\n=== %s ===\n", title);
+    }
+    fprintf(stdout, "(Ctrl+C to interrupt. After fdisk exits, press Enter to return to the installer.)\n\n");
+    fflush(stdout);
+    int rc = system(command);
+    fprintf(stdout, "\nCommand finished. Press Enter to continue...");
+    fflush(stdout);
+    while (1) {
+        int ch = getchar();
+        if (ch == '\n' || ch == EOF) {
+            break;
+        }
+    }
+    reset_prog_mode();
+    refresh();
+    ui_relayout();
+
+    if (rc == -1) {
+        return -1;
+    }
+    if (WIFEXITED(rc)) {
+        return WEXITSTATUS(rc);
+    }
+    return -1;
 }
 
 int ui_wait_for_process(const char *title, const char *message, pid_t pid)

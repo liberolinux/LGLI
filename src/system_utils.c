@@ -425,7 +425,11 @@ int mount_fs(const char *device, const char *mountpoint, const char *fstype, con
     }
 
     const char *opts = options ? options : "";
-    if (mount(device, mountpoint, fstype, 0, opts) != 0) {
+    unsigned long flags = 0;
+    if (!opts[0]) {
+        flags = MS_NOATIME;
+    }
+    if (mount(device, mountpoint, fstype, flags, opts[0] ? opts : NULL) != 0) {
         log_error("Failed to mount %s on %s (type=%s opts=%s): %s", device, mountpoint, fstype, opts, strerror(errno));
         return -1;
     }

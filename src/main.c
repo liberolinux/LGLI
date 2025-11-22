@@ -16,6 +16,11 @@ static void show_log_location(void)
 
 int main(void)
 {
+    if (geteuid() != 0) {
+        fprintf(stderr, "%s requires root privileges. Please run as root or via sudo.\n", INSTALLER_NAME);
+        return 1;
+    }
+
     InstallerState state;
     installer_state_init(&state);
     ensure_directory(INSTALL_CACHE_DIR, 0755);

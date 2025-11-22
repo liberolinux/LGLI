@@ -3,12 +3,22 @@
 #include <dirent.h>
 #include <fcntl.h>
 
+#define LABEL_BOOT "LIBERO_BOOT"
+#define LABEL_EFI "LIBERO_EFI"
+#define LABEL_ROOT "LIBERO_ROOT"
+#define LABEL_SWAP "LIBERO_SWAP"
+
 typedef struct {
     char name[64];
     char path[PATH_MAX];
     char model[128];
     long size_mb;
 } DiskInfo;
+
+typedef struct {
+    char device[PATH_MAX];
+    char size[32];
+} PartitionChoice;
 
 static int is_usable_disk(const char *name)
 {
@@ -118,6 +128,156 @@ static int ensure_parent_dir(const char *path)
     return ensure_directory(dir, 0755);
 }
 
+static PartitionChoice *list_disk_partitions(const char *disk, size_t *out_count)
+{
+    if (!disk || !disk[0]) {
+        return NULL;
+    }
+
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "lsblk -nrpo NAME,TYPE,SIZE %s", disk);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    size_t capacity = 8;
+    size_t count = 0;
+    PartitionChoice *entries = calloc(capacity, sizeof(*entries));
+    if (!entries) {
+        pclose(fp);
+        return NULL;
+    }
+
+    char line[PATH_MAX + 64];
+    while (fgets(line, sizeof(line), fp)) {
+        char name[PATH_MAX];
+        char type[32];
+        char size[32];
+        if (sscanf(line, "%s %31s %31s", name, type, size) != 3) {
+            continue;
+        }
+        if (strcmp(type, "part") != 0) {
+            continue;
+        }
+        if (count == capacity) {
+            capacity *= 2;
+            PartitionChoice *tmp = realloc(entries, capacity * sizeof(*entries));
+            if (!tmp) {
+                free(entries);
+                pclose(fp);
+                return NULL;
+            }
+            entries = tmp;
+        }
+        snprintf(entries[count].device, sizeof(entries[count].device), "%s", name);
+        snprintf(entries[count].size, sizeof(entries[count].size), "%s", size);
+        count++;
+    }
+    pclose(fp);
+    if (count == 0) {
+        free(entries);
+        return NULL;
+    }
+    if (out_count) {
+        *out_count = count;
+    }
+    return entries;
+}
+
+static int prompt_partition_selection(const char *title,
+                                      const char *subtitle,
+                                      PartitionChoice *choices,
+                                      size_t count,
+                                      bool *used,
+                                      bool optional,
+                                      char *out,
+                                      size_t out_len)
+{
+    if (!choices || count == 0 || !out || out_len == 0) {
+        return -1;
+    }
+
+    size_t available = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (!used[i]) {
+            available++;
+        }
+    }
+    if (available == 0) {
+        if (optional) {
+            out[0] = '\0';
+            return 0;
+        }
+        ui_message(title, "No unused partitions remain.");
+        return -1;
+    }
+
+    size_t item_total = available + (optional ? 1 : 0);
+    char **items = calloc(item_total, sizeof(char *));
+    int *index_map = calloc(item_total, sizeof(int));
+    if (!items || !index_map) {
+        free(items);
+        free(index_map);
+        return -1;
+    }
+
+    size_t idx = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (used[i]) {
+            continue;
+        }
+        char display[PATH_MAX + 48];
+        snprintf(display, sizeof(display), "%s (%s)", choices[i].device, choices[i].size);
+        items[idx] = strdup(display);
+        if (!items[idx]) {
+            for (size_t j = 0; j < idx; ++j) {
+                free(items[j]);
+            }
+            free(items);
+            free(index_map);
+            return -1;
+        }
+        index_map[idx] = (int)i;
+        idx++;
+    }
+    if (optional) {
+        items[idx] = strdup("<Skip>");
+        if (!items[idx]) {
+            for (size_t j = 0; j < idx; ++j) {
+                free(items[j]);
+            }
+            free(items);
+            free(index_map);
+            return -1;
+        }
+        index_map[idx] = -1;
+    }
+
+    int choice = ui_menu(title, subtitle, (const char **)items, item_total, 0);
+    for (size_t i = 0; i < item_total; ++i) {
+        free(items[i]);
+    }
+    free(items);
+
+    if (choice < 0) {
+        free(index_map);
+        return -1;
+    }
+
+    int selected_index = index_map[choice];
+    free(index_map);
+
+    if (selected_index < 0) {
+        out[0] = '\0';
+        return 0;
+    }
+
+    used[selected_index] = true;
+    snprintf(out, out_len, "%s", choices[selected_index].device);
+    return 0;
+}
+
 static void migrate_cache_file(const char *old_path, const char *new_path)
 {
     if (!old_path || !new_path || strcmp(old_path, new_path) == 0) {
@@ -141,26 +301,6 @@ static void migrate_cache_file(const char *old_path, const char *new_path)
     }
 
     log_error("Failed to move cache file from %s to %s: %s", old_path, new_path, strerror(errno));
-}
-
-static int join_path(char *dest, size_t dest_len, const char *base, const char *suffix)
-{
-    if (!dest || dest_len == 0 || !base || !suffix) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    size_t base_len = strlen(base);
-    size_t suffix_len = strlen(suffix);
-    if (base_len + suffix_len >= dest_len) {
-        errno = ENAMETOOLONG;
-        log_error("Path too long: %s%s", base, suffix);
-        return -1;
-    }
-
-    memcpy(dest, base, base_len);
-    memcpy(dest + base_len, suffix, suffix_len + 1);
-    return 0;
 }
 
 static DiskInfo *collect_disks(size_t *out_count)
@@ -248,13 +388,6 @@ static void human_size(long size_mb, char *buffer, size_t len)
     } else {
         snprintf(buffer, len, "%ld MB", size_mb);
     }
-}
-
-static void partition_path(const char *disk, int number, char *buffer, size_t len)
-{
-    size_t disk_len = strlen(disk);
-    const char *suffix = (disk_len > 0 && isdigit((unsigned char)disk[disk_len - 1])) ? "p" : "";
-    snprintf(buffer, len, "%s%s%d", disk, suffix, number);
 }
 
 static int deactivate_swap_for_disk(const char *disk)
@@ -443,16 +576,17 @@ static int configure_swap(InstallerState *state)
     return 0;
 }
 
-static int format_partition(const char *device, const char *type)
+static int format_partition(const char *device, const char *type, const char *label)
 {
+    const char *fs_label = (label && label[0]) ? label : "LIBERO";
     if (strcmp(type, "boot") == 0) {
-        return run_command("mkfs.ext2 -F %s", device);
+        return run_command("mkfs.ext2 -F -L %s %s", fs_label, device);
     }
     if (strcmp(type, "efi") == 0) {
-        return run_command("mkfs.vfat -F32 %s", device);
+        return run_command("mkfs.vfat -F32 -n %s %s", fs_label, device);
     }
     if (strcmp(type, "swap") == 0) {
-        if (run_command("mkswap %s", device) != 0) {
+        if (run_command("mkswap -L %s %s", fs_label, device) != 0) {
             return -1;
         }
         return run_command("swapon %s", device);
@@ -460,24 +594,20 @@ static int format_partition(const char *device, const char *type)
     return -1;
 }
 
-static int format_root(const InstallerState *state)
+static int format_root(const InstallerState *state, const char *label)
 {
     const char *device = state->root_mapper[0] ? state->root_mapper : state->root_partition;
+    const char *fs_label = (label && label[0]) ? label : LABEL_ROOT;
     switch (state->root_fs) {
     case FS_EXT4:
-        return run_command("mkfs.ext4 -F %s", device);
+        return run_command("mkfs.ext4 -F -L %s %s", fs_label, device);
     case FS_XFS:
-        return run_command("mkfs.xfs -f %s", device);
+        return run_command("mkfs.xfs -f -L %s %s", fs_label, device);
     case FS_BTRFS:
-        return run_command("mkfs.btrfs -f %s", device);
+        return run_command("mkfs.btrfs -f -L %s %s", fs_label, device);
     default:
         return -1;
     }
-}
-
-static const char *root_fs_name(const InstallerState *state)
-{
-    return fs_to_string(state->root_fs);
 }
 
 static int prompt_passphrase(char *buffer, size_t len)
@@ -577,60 +707,6 @@ static int handle_lvm(InstallerState *state)
     return 0;
 }
 
-static int mount_partitions(InstallerState *state)
-{
-    if (ensure_directory(state->install_root, 0755) != 0) {
-        return -1;
-    }
-
-    const char *root_device = state->root_mapper[0] ? state->root_mapper : state->root_partition;
-    if (mount_fs(root_device, state->install_root, root_fs_name(state), "defaults,noatime") != 0) {
-        return -1;
-    }
-
-    char boot_mount[PATH_MAX];
-    if (join_path(boot_mount, sizeof(boot_mount), state->install_root, "/boot") != 0) {
-        return -1;
-    }
-    if (ensure_directory(boot_mount, 0755) != 0) {
-        return -1;
-    }
-    if (mount_fs(state->boot_partition, boot_mount, "ext2", "defaults,noatime") != 0) {
-        return -1;
-    }
-
-    if (state->boot_mode == BOOTMODE_UEFI) {
-        char efi_mount[PATH_MAX];
-        if (join_path(efi_mount, sizeof(efi_mount), state->install_root, "/boot/efi") != 0) {
-            return -1;
-        }
-        if (mount_fs(state->efi_partition, efi_mount, "vfat", "defaults,umask=0077") != 0) {
-            return -1;
-        }
-    }
-
-    if (!state->use_lvm && state->swap_partition[0] && state->swap_size_mb > 0) {
-        if (format_partition(state->swap_partition, "swap") != 0) {
-            return -1;
-        }
-        snprintf(state->swap_mapper, sizeof(state->swap_mapper), "%s", state->swap_partition);
-    } else if (state->use_lvm && state->swap_mapper[0]) {
-        if (run_command("mkswap %s", state->swap_mapper) != 0) {
-            return -1;
-        }
-        if (run_command("swapon %s", state->swap_mapper) != 0) {
-            return -1;
-        }
-    }
-
-    char cache_dir[PATH_MAX];
-    if (installer_state_cache_dir(state, true, cache_dir, sizeof(cache_dir)) == 0) {
-        ensure_directory(cache_dir, 0755);
-    }
-
-    return 0;
-}
-
 static int apply_partitioning(InstallerState *state)
 {
     if (!state->target_disk[0]) {
@@ -655,83 +731,96 @@ static int apply_partitioning(InstallerState *state)
         return -1;
     }
 
-    if (run_command("wipefs -a %s", state->target_disk) != 0) {
+    if (run_command("/usr/sbin/wipefs -a %s", state->target_disk) != 0) {
         return -1;
     }
 
-    const char *label = (state->boot_mode == BOOTMODE_UEFI) ? "gpt" : "msdos";
-    if (run_command("parted -s %s mklabel %s", state->target_disk, label) != 0) {
+    ui_message("fdisk", "The installer will now launch fdisk. Create or edit partitions as needed, then quit fdisk.");
+    char fdisk_cmd[PATH_MAX + 32];
+    snprintf(fdisk_cmd, sizeof(fdisk_cmd), "/usr/sbin/fdisk %s", state->target_disk);
+    if (ui_run_shell_command("fdisk", fdisk_cmd) != 0) {
+        ui_message("Partitioning", "fdisk reported an error.");
         return -1;
-    }
-
-    double start = 1.0;
-    int part_number = 1;
-
-    if (state->boot_mode == BOOTMODE_UEFI) {
-        double end = start + 512;
-        if (run_command("parted -s %s mkpart ESP fat32 %.0fMiB %.0fMiB", state->target_disk, start, end) != 0) {
-            return -1;
-        }
-        if (run_command("parted -s %s set %d esp on", state->target_disk, part_number) != 0) {
-            return -1;
-        }
-        partition_path(state->target_disk, part_number++, state->efi_partition, sizeof(state->efi_partition));
-        start = end;
-    } else {
-        state->efi_partition[0] = '\0';
-    }
-
-    double boot_end = start + 512;
-    if (run_command("parted -s %s mkpart primary ext2 %.0fMiB %.0fMiB", state->target_disk, start, boot_end) != 0) {
-        return -1;
-    }
-    if (state->boot_mode == BOOTMODE_LEGACY) {
-        if (run_command("parted -s %s set %d boot on", state->target_disk, part_number) != 0) {
-            return -1;
-        }
-    }
-    partition_path(state->target_disk, part_number++, state->boot_partition, sizeof(state->boot_partition));
-    start = boot_end;
-
-    if (!state->use_lvm && state->swap_size_mb > 0) {
-        double swap_end = start + state->swap_size_mb;
-        if (run_command("parted -s %s mkpart primary linux-swap %.0fMiB %.0fMiB",
-                        state->target_disk, start, swap_end) != 0) {
-            return -1;
-        }
-        partition_path(state->target_disk, part_number++, state->swap_partition, sizeof(state->swap_partition));
-        start = swap_end;
-    } else {
-        state->swap_partition[0] = '\0';
-    }
-
-    double root_end = state->disk_size_mb - 8;
-    if (root_end <= start + 128) {
-        ui_message("Partitioning", "Not enough space for root filesystem.");
-        return -1;
-    }
-
-    if (run_command("parted -s %s mkpart primary ext4 %.0fMiB %.0fMiB",
-                    state->target_disk, start, root_end) != 0) {
-        return -1;
-    }
-    partition_path(state->target_disk, part_number++, state->root_partition, sizeof(state->root_partition));
-
-    if (state->use_lvm) {
-        if (run_command("parted -s %s set %d lvm on", state->target_disk, part_number - 1) != 0) {
-            return -1;
-        }
     }
 
     if (run_command("partprobe %s", state->target_disk) != 0) {
         return -1;
     }
 
-    if (format_partition(state->boot_partition, "boot") != 0) {
+    size_t part_count = 0;
+    PartitionChoice *parts = list_disk_partitions(state->target_disk, &part_count);
+    if (!parts) {
+        ui_message("Partitioning", "Unable to detect partitions on the target disk.");
         return -1;
     }
+    bool *used = calloc(part_count, sizeof(bool));
+    if (!used) {
+        free(parts);
+        return -1;
+    }
+
+    if (state->boot_mode == BOOTMODE_UEFI) {
+        if (prompt_partition_selection("EFI Partition",
+                                       "Select the partition that will be mounted at /boot/efi",
+                                       parts, part_count, used, false,
+                                       state->efi_partition, sizeof(state->efi_partition)) != 0) {
+            free(used);
+            free(parts);
+            return -1;
+        }
+    } else {
+        state->efi_partition[0] = '\0';
+    }
+
+    if (state->boot_mode == BOOTMODE_UEFI) {
+        if (prompt_partition_selection("Boot Partition",
+                                       "Select the partition that will be mounted at /boot",
+                                       parts, part_count, used, false,
+                                       state->boot_partition, sizeof(state->boot_partition)) != 0) {
+            free(used);
+            free(parts);
+            return -1;
+        }
+    } else {
+        state->boot_partition[0] = '\0';
+    }
+
+    if (prompt_partition_selection("Root Partition",
+                                   "Select the partition that will contain the root filesystem",
+                                   parts, part_count, used, false,
+                                   state->root_partition, sizeof(state->root_partition)) != 0) {
+        free(used);
+        free(parts);
+        return -1;
+    }
+
+    if (!state->use_lvm && state->swap_size_mb > 0) {
+        if (prompt_partition_selection("Swap Partition",
+                                       "Select a partition for swap (or choose Skip)",
+                                       parts, part_count, used, true,
+                                       state->swap_partition, sizeof(state->swap_partition)) != 0) {
+            free(used);
+            free(parts);
+            return -1;
+        }
+    } else {
+        state->swap_partition[0] = '\0';
+    }
+
+    free(used);
+    free(parts);
+
+    if (run_command("partprobe %s", state->target_disk) != 0) {
+        return -1;
+    }
+
+    if (state->boot_partition[0]) {
+        if (format_partition(state->boot_partition, "boot", LABEL_BOOT) != 0) {
+            return -1;
+        }
+    }
     if (state->efi_partition[0]) {
-        if (format_partition(state->efi_partition, "efi") != 0) {
+        if (format_partition(state->efi_partition, "efi", LABEL_EFI) != 0) {
             return -1;
         }
     }
@@ -742,33 +831,28 @@ static int apply_partitioning(InstallerState *state)
     if (handle_lvm(state) != 0) {
         return -1;
     }
-    if (format_root(state) != 0) {
-        return -1;
-    }
-    if (mount_partitions(state) != 0) {
+    if (format_root(state, LABEL_ROOT) != 0) {
         return -1;
     }
 
-    state->disk_prepared = true;
-
-    char old_stage3[PATH_MAX];
-    char old_digest[PATH_MAX];
-    char old_portage[PATH_MAX];
-    snprintf(old_stage3, sizeof(old_stage3), "%s", state->stage3_local);
-    snprintf(old_digest, sizeof(old_digest), "%s", state->stage3_digest_local);
-    snprintf(old_portage, sizeof(old_portage), "%s", state->portage_local);
-
-    char cache_dir[PATH_MAX];
-    if (installer_state_cache_dir(state, true, cache_dir, sizeof(cache_dir)) == 0) {
-        if (ensure_directory(cache_dir, 0755) == 0) {
-            installer_state_set_cache_dir(state, cache_dir);
-            migrate_cache_file(old_stage3, state->stage3_local);
-            migrate_cache_file(old_digest, state->stage3_digest_local);
-            migrate_cache_file(old_portage, state->portage_local);
+    if (!state->use_lvm && state->swap_partition[0] && state->swap_size_mb > 0) {
+        if (format_partition(state->swap_partition, "swap", LABEL_SWAP) != 0) {
+            return -1;
+        }
+        snprintf(state->swap_mapper, sizeof(state->swap_mapper), "%s", state->swap_partition);
+    } else if (state->use_lvm && state->swap_mapper[0]) {
+        if (run_command("mkswap -L %s %s", LABEL_SWAP, state->swap_mapper) != 0) {
+            return -1;
+        }
+        if (run_command("swapon %s", state->swap_mapper) != 0) {
+            return -1;
         }
     }
 
-    ui_message("Partitioning Complete", "Disk partitioning and mounting finished successfully.");
+    state->disk_prepared = false;
+
+    ui_message("Partitioning Complete",
+               "Disk partitioning and formatting finished. Use Disk preparation -> Mount target root partition before continuing.");
     return 0;
 }
 
@@ -795,8 +879,8 @@ int disk_workflow(InstallerState *state)
             "Configure swap size",
             "Toggle LUKS encryption",
             "Toggle LVM support",
-            "Partition, format, and mount",
-            "Mount target partitions",
+            "Partition and format",
+            "Mount target root partition",
             "Back to main menu",
         };
 
@@ -870,12 +954,30 @@ int disk_mount_targets(InstallerState *state)
              root_device, state->install_root, fs_to_string(state->root_fs));
     log_fs_probe(root_device);
 
-    if (mount_fs(root_device, state->install_root, fs_to_string(state->root_fs), "defaults,noatime") != 0) {
+    if (mount_fs(root_device, state->install_root, fs_to_string(state->root_fs), "") != 0) {
         ui_message("Mount", "Failed to mount the root partition. Check the log for details.");
         return -1;
     }
 
     state->disk_prepared = true;
+
+    char old_stage3[PATH_MAX];
+    char old_digest[PATH_MAX];
+    char old_portage[PATH_MAX];
+    snprintf(old_stage3, sizeof(old_stage3), "%s", state->stage3_local);
+    snprintf(old_digest, sizeof(old_digest), "%s", state->stage3_digest_local);
+    snprintf(old_portage, sizeof(old_portage), "%s", state->portage_local);
+
+    char cache_dir[PATH_MAX];
+    if (installer_state_cache_dir(state, true, cache_dir, sizeof(cache_dir)) == 0) {
+        if (ensure_directory(cache_dir, 0755) == 0) {
+            installer_state_set_cache_dir(state, cache_dir);
+            migrate_cache_file(old_stage3, state->stage3_local);
+            migrate_cache_file(old_digest, state->stage3_digest_local);
+            migrate_cache_file(old_portage, state->portage_local);
+        }
+    }
+
     log_info("Mounted root device %s on %s", root_device, state->install_root);
     ui_message("Mount", "Root partition mounted at the install root.");
     return 0;

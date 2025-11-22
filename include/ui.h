@@ -21,5 +21,6 @@ int ui_prompt_input(const char *title,
                     size_t buffer_len,
                     const char *initial,
                     bool secret);
+int ui_run_shell_command(const char *title, const char *command);
 
 #endif /* LIBERO_INSTALLER_UI_H */

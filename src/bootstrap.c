@@ -158,7 +158,7 @@ static int download_stage3(InstallerState *state)
 {
     state->disk_prepared = is_path_mounted(state->install_root);
     if (!state->disk_prepared) {
-        ui_message("Download", "Root partition is not mounted at the install path. Use Disk preparation -> Mount target partitions, then try again.");
+        ui_message("Download", "Root partition is not mounted at the install path. Use Disk preparation -> Mount target root partition, then try again.");
         return -1;
     }
 
